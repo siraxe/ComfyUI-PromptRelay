@@ -1,5 +1,6 @@
 import logging
 
+import torch
 from comfy_api.latest import io
 
 from .prompt_relay import (
@@ -129,20 +130,30 @@ class PromptRelayLoraSchedule(io.ComfyNode):
             category="conditioning/prompt_relay",
             description=(
                 "Applies different LoRAs to different temporal segments. Connect model and "
-                "relay_config from PromptRelayEncode. LoRA A is required; LoRA B/C/D are optional. "
-                "If fewer LoRAs than segments, the last LoRA repeats."
+                "relay_config from PromptRelayEncode. Each LoRA slot maps directly to a segment "
+                "(A→segment 0, B→segment 1, …). Set a slot to 'none' to skip that segment. "
+                "extend_last controls whether the last assigned LoRA fills remaining segments."
             ),
             inputs=[
                 io.Model.Input("model", tooltip="Model output from PromptRelayEncode."),
                 io.Custom("PROMPT_RELAY_CONFIG").Input("relay_config"),
-                io.Combo.Input("lora_name", options=lora_list, tooltip="Required: first LoRA."),
+                io.Float.Input(
+                    "epsilon", default=1e-3, min=1e-6, max=0.99, step=1e-4,
+                    tooltip="LoRA blend transition sharpness. Below ~0.1 gives sharp cuts (default 0.001). Use 0.5+ for softer crossfades.",
+                ),
+                io.Boolean.Input("extend_last", default=True, tooltip="If true, the last assigned LoRA fills any remaining segments beyond the LoRA slots."),
+                io.Combo.Input("lora_name", options=["none"] + lora_list, tooltip="LoRA for segment 0."),
                 io.Float.Input("strength", default=1.0, min=-10.0, max=10.0, step=0.01),
-                io.Combo.Input("lora_name_2", options=["none"] + lora_list, optional=True, tooltip="Optional: second LoRA."),
+                io.Combo.Input("lora_name_2", options=["none"] + lora_list, optional=True, tooltip="LoRA for segment 1."),
                 io.Float.Input("strength_2", default=1.0, min=-10.0, max=10.0, step=0.01, optional=True),
-                io.Combo.Input("lora_name_3", options=["none"] + lora_list, optional=True, tooltip="Optional: third LoRA."),
+                io.Combo.Input("lora_name_3", options=["none"] + lora_list, optional=True, tooltip="LoRA for segment 2."),
                 io.Float.Input("strength_3", default=1.0, min=-10.0, max=10.0, step=0.01, optional=True),
-                io.Combo.Input("lora_name_4", options=["none"] + lora_list, optional=True, tooltip="Optional: fourth LoRA."),
+                io.Combo.Input("lora_name_4", options=["none"] + lora_list, optional=True, tooltip="LoRA for segment 3."),
                 io.Float.Input("strength_4", default=1.0, min=-10.0, max=10.0, step=0.01, optional=True),
+                io.Combo.Input("lora_name_5", options=["none"] + lora_list, optional=True, tooltip="LoRA for segment 4."),
+                io.Float.Input("strength_5", default=1.0, min=-10.0, max=10.0, step=0.01, optional=True),
+                io.Combo.Input("lora_name_6", options=["none"] + lora_list, optional=True, tooltip="LoRA for segment 5."),
+                io.Float.Input("strength_6", default=1.0, min=-10.0, max=10.0, step=0.01, optional=True),
             ],
             outputs=[
                 io.Model.Output(display_name="model"),
@@ -153,22 +164,38 @@ class PromptRelayLoraSchedule(io.ComfyNode):
     def execute(cls, model, relay_config, lora_name, strength,
                 lora_name_2=None, strength_2=1.0,
                 lora_name_3=None, strength_3=1.0,
-                lora_name_4=None, strength_4=1.0) -> io.NodeOutput:
+                lora_name_4=None, strength_4=1.0,
+                lora_name_5=None, strength_5=1.0,
+                lora_name_6=None, strength_6=1.0,
+                epsilon=1e-3, extend_last=True) -> io.NodeOutput:
 
-        if not lora_name.strip():
-            raise ValueError("LoRA A (lora_name) is required")
-
-        # Collect provided LoRAs
-        lora_entries = [
+        # Build slot map: each slot maps to a LoRA column index or None (no LoRA)
+        all_slots = [
             (lora_name, strength),
+            (lora_name_2, strength_2),
+            (lora_name_3, strength_3),
+            (lora_name_4, strength_4),
+            (lora_name_5, strength_5),
+            (lora_name_6, strength_6),
         ]
-        for name, s in [(lora_name_2, strength_2), (lora_name_3, strength_3), (lora_name_4, strength_4)]:
+
+        lora_slot_map = []   # per-slot: LoRA column index or None
+        lora_entries = []    # only the non-none entries in column order
+
+        for name, s in all_slots:
             if name and name not in ("none", ""):
+                lora_slot_map.append(len(lora_entries))
                 lora_entries.append((name, s))
+            else:
+                lora_slot_map.append(None)
+
+        if not lora_entries:
+            log.info("[PromptRelay] LoRA Schedule: no LoRAs assigned, passing model through unchanged")
+            return io.NodeOutput(model)
 
         num_loras = len(lora_entries)
         num_segments = relay_config.num_segments
-        lora_assignment = build_lora_assignment(num_segments, num_loras)
+        lora_assignment = build_lora_assignment(num_segments, lora_slot_map, extend_last)
 
         log.info(
             "[PromptRelay] LoRA Schedule: %d LoRAs for %d segments, assignment: %s",
@@ -190,6 +217,7 @@ class PromptRelayLoraSchedule(io.ComfyNode):
             lora_assignment,
             num_loras,
             device="cpu",
+            epsilon=epsilon,
         )
 
         # Reorganize deltas by model key for patching

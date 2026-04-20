@@ -1,4 +1,5 @@
 import logging
+import math
 import types
 
 import folder_paths
@@ -64,28 +65,75 @@ def load_lora_weights(lora_name, model):
     return deltas
 
 
-def build_lora_assignment(num_segments, num_loras):
-    """Map each segment index to a LoRA index (repeat last LoRA if fewer than segments)."""
-    if num_loras == 0:
-        raise ValueError("At least one LoRA is required")
-    return [min(i, num_loras - 1) for i in range(num_segments)]
+def build_lora_assignment(num_segments, lora_slot_map, extend_last):
+    """Map each segment index to a LoRA column index or -1 (no LoRA).
 
-
-def build_blend_tensor(segment_lengths, tokens_per_frame, lora_assignment, num_loras, device):
-    """Build a [total_tokens, num_loras] one-hot blend tensor.
-
-    Each token is assigned to the LoRA of its segment.
+    lora_slot_map: list of LoRA column indices or None, one per slot.
+                   Slot *i* maps to segment *i*.  ``None`` means that slot is "none".
+    extend_last: if True, the last assigned LoRA fills any remaining segments.
     """
-    total_tokens = sum(segment_lengths) * tokens_per_frame
+    if num_segments == 0:
+        raise ValueError("At least one segment is required")
+
+    assignment = []
+    last_lora_idx = None
+
+    for seg_idx in range(num_segments):
+        if seg_idx < len(lora_slot_map):
+            slot = lora_slot_map[seg_idx]
+            if slot is not None:
+                assignment.append(slot)
+                last_lora_idx = slot
+            else:
+                # Slot is "none" — no LoRA unless extending
+                assignment.append(last_lora_idx if extend_last and last_lora_idx is not None else -1)
+        else:
+            # Beyond the LoRA slots
+            assignment.append(last_lora_idx if extend_last and last_lora_idx is not None else -1)
+
+    return assignment
+
+
+def build_blend_tensor(segment_lengths, tokens_per_frame, lora_assignment, num_loras, device, epsilon=1e-3):
+    """Build a [total_tokens, num_loras] blend tensor with Gaussian transitions.
+
+    Each token receives a weight per LoRA based on Gaussian proximity to that
+    LoRA's segment.  Inside the segment window the weight is 1.0; outside it
+    decays as exp(-((d-window)^2) / (2*sigma^2)).  Smaller *epsilon* gives
+    sharper transitions (same formula as the prompt-relay attention mask).
+    """
+    sigma = 1.0 / math.log(1.0 / epsilon) if 0 < epsilon < 1 else 0.1448
+
+    total_frames = sum(segment_lengths)
+    total_tokens = total_frames * tokens_per_frame
     blend = torch.zeros(total_tokens, num_loras, device=device)
 
+    # Collect metadata for segments that have a LoRA
+    seg_info = []  # (midpoint, window, lora_idx)
     frame_cursor = 0
     for seg_idx, seg_len in enumerate(segment_lengths):
         lora_idx = lora_assignment[seg_idx]
-        token_start = frame_cursor * tokens_per_frame
-        token_end = (frame_cursor + seg_len) * tokens_per_frame
-        blend[token_start:token_end, lora_idx] = 1.0
+        if lora_idx >= 0 and seg_len > 0:
+            midpoint = (2 * frame_cursor + seg_len) // 2
+            window = max(seg_len // 2 - 2, 0)
+            seg_info.append((midpoint, window, lora_idx))
         frame_cursor += seg_len
+
+    if not seg_info:
+        return blend
+
+    frames = torch.arange(total_frames, device=device, dtype=torch.float32)
+    two_sigma_sq = 2.0 * sigma * sigma
+
+    for midpoint, window, lora_idx in seg_info:
+        d = (frames - midpoint).abs()
+        weights = torch.where(
+            d <= window,
+            torch.ones_like(d),
+            torch.exp(-((d - window).pow(2)) / two_sigma_sq),
+        )
+        token_weights = weights.repeat_interleave(tokens_per_frame)
+        blend[:, lora_idx] += token_weights
 
     return blend
 
