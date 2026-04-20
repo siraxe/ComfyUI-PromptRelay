@@ -3,11 +3,19 @@ import logging
 from comfy_api.latest import io
 
 from .prompt_relay import (
+    RelayConfig,
     get_raw_tokenizer,
     map_token_indices,
     build_segments,
     create_mask_fn,
     distribute_segment_lengths,
+)
+
+from .lora_schedule import (
+    load_lora_weights,
+    build_lora_assignment,
+    build_blend_tensor,
+    apply_lora_temporal_patches,
 )
 
 from .patches import detect_model_type, apply_patches
@@ -53,6 +61,7 @@ class PromptRelayEncode(io.ComfyNode):
             outputs=[
                 io.Model.Output(display_name="model"),
                 io.Conditioning.Output(display_name="positive"),
+                io.Custom("PROMPT_RELAY_CONFIG").Output(display_name="relay_config"),
             ],
         )
 
@@ -95,13 +104,140 @@ class PromptRelayEncode(io.ComfyNode):
         patched = model.clone()
         apply_patches(patched, arch, mask_fn)
 
-        return io.NodeOutput(patched, conditioning)
+        config = RelayConfig(
+            num_segments=len(locals_list),
+            segment_lengths=effective_lengths,
+            tokens_per_frame=tokens_per_frame,
+            latent_frames=latent_frames,
+            epsilon=epsilon,
+            arch=arch,
+            patch_size=patch_size,
+        )
 
+        return io.NodeOutput(patched, conditioning, config)
+
+
+class PromptRelayLoraSchedule(io.ComfyNode):
+    """Applies different LoRAs to different temporal segments defined by PromptRelayEncode."""
+
+    @classmethod
+    def define_schema(cls):
+        lora_list = folder_paths.get_filename_list("loras")
+        return io.Schema(
+            node_id="PromptRelayLoraSchedule",
+            display_name="Prompt Relay LoRA Schedule",
+            category="conditioning/prompt_relay",
+            description=(
+                "Applies different LoRAs to different temporal segments. Connect model and "
+                "relay_config from PromptRelayEncode. LoRA A is required; LoRA B/C/D are optional. "
+                "If fewer LoRAs than segments, the last LoRA repeats."
+            ),
+            inputs=[
+                io.Model.Input("model", tooltip="Model output from PromptRelayEncode."),
+                io.Custom("PROMPT_RELAY_CONFIG").Input("relay_config"),
+                io.Combo.Input("lora_name", options=lora_list, tooltip="Required: first LoRA."),
+                io.Float.Input("strength", default=1.0, min=-10.0, max=10.0, step=0.01),
+                io.Combo.Input("lora_name_2", options=["none"] + lora_list, optional=True, tooltip="Optional: second LoRA."),
+                io.Float.Input("strength_2", default=1.0, min=-10.0, max=10.0, step=0.01, optional=True),
+                io.Combo.Input("lora_name_3", options=["none"] + lora_list, optional=True, tooltip="Optional: third LoRA."),
+                io.Float.Input("strength_3", default=1.0, min=-10.0, max=10.0, step=0.01, optional=True),
+                io.Combo.Input("lora_name_4", options=["none"] + lora_list, optional=True, tooltip="Optional: fourth LoRA."),
+                io.Float.Input("strength_4", default=1.0, min=-10.0, max=10.0, step=0.01, optional=True),
+            ],
+            outputs=[
+                io.Model.Output(display_name="model"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, model, relay_config, lora_name, strength,
+                lora_name_2=None, strength_2=1.0,
+                lora_name_3=None, strength_3=1.0,
+                lora_name_4=None, strength_4=1.0) -> io.NodeOutput:
+
+        if not lora_name.strip():
+            raise ValueError("LoRA A (lora_name) is required")
+
+        # Collect provided LoRAs
+        lora_entries = [
+            (lora_name, strength),
+        ]
+        for name, s in [(lora_name_2, strength_2), (lora_name_3, strength_3), (lora_name_4, strength_4)]:
+            if name and name not in ("none", ""):
+                lora_entries.append((name, s))
+
+        num_loras = len(lora_entries)
+        num_segments = relay_config.num_segments
+        lora_assignment = build_lora_assignment(num_segments, num_loras)
+
+        log.info(
+            "[PromptRelay] LoRA Schedule: %d LoRAs for %d segments, assignment: %s",
+            num_loras, num_segments, lora_assignment,
+        )
+
+        # Load all LoRA weights
+        all_lora_deltas = []
+        for name, s in lora_entries:
+            deltas = load_lora_weights(name, model)
+            # Apply strength to alpha_scale
+            scaled = {k: (up, down, alpha * s) for k, (up, down, alpha) in deltas.items()}
+            all_lora_deltas.append(scaled)
+
+        # Build blend tensor [total_tokens, num_loras]
+        blend = build_blend_tensor(
+            relay_config.segment_lengths,
+            relay_config.tokens_per_frame,
+            lora_assignment,
+            num_loras,
+            device="cpu",
+        )
+
+        # Reorganize deltas by model key for patching
+        # lora_deltas_by_key: {model_key: [(lora_up, lora_down, alpha_scale), ...]}
+        lora_deltas_by_key = {}
+        all_keys = set()
+        for deltas in all_lora_deltas:
+            all_keys.update(deltas.keys())
+
+        for key in all_keys:
+            per_lora = []
+            for deltas in all_lora_deltas:
+                if key in deltas:
+                    per_lora.append(deltas[key])
+                else:
+                    per_lora.append(None)
+            # Only include keys that have at least one LoRA
+            if any(p is not None for p in per_lora):
+                # Fill missing entries with zero-sized placeholders (no contribution)
+                filled = []
+                for p in per_lora:
+                    if p is not None:
+                        filled.append(p)
+                    else:
+                        # Create zero delta with same shape as a real one
+                        ref = next(pp for pp in per_lora if pp is not None)
+                        filled.append((
+                            torch.zeros_like(ref[0]),
+                            torch.zeros_like(ref[1]),
+                            0.0,
+                        ))
+                lora_deltas_by_key[key] = filled
+
+        # Patch model
+        patched = model.clone()
+        apply_lora_temporal_patches(patched, lora_deltas_by_key, blend)
+
+        return io.NodeOutput(patched)
+
+
+import folder_paths
 
 NODE_CLASS_MAPPINGS = {
     "PromptRelayEncode": PromptRelayEncode,
+    "PromptRelayLoraSchedule": PromptRelayLoraSchedule,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PromptRelayEncode": "Prompt Relay Encode",
+    "PromptRelayLoraSchedule": "Prompt Relay LoRA Schedule",
 }
