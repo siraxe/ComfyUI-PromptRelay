@@ -218,7 +218,7 @@ class PromptRelayLoraSchedule(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, relay_config, lora_stack_1,
+    def execute(cls, model, relay_config, lora_stack_1=None,
                 epsilon=1e-3, extend_last=True,
                 lora_stack_2=None, lora_stack_3=None,
                 lora_stack_4=None, lora_stack_5=None,
