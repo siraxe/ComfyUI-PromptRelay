@@ -118,21 +118,84 @@ class PromptRelayEncode(io.ComfyNode):
         return io.NodeOutput(patched, conditioning, config)
 
 
+class _AnyType(str):
+    """String subclass where ``!=`` always returns False, so type-equality
+    checks against this wildcard always succeed.  (Credit: pythongosssss)"""
+    def __ne__(self, __value):
+        return False
+
+
+class _FlexibleOptionalInputType(dict):
+    """Mirrors rgthree's FlexibleOptionalInputType: tells ComfyUI to accept
+    any additional optional inputs (the dynamic JS widgets lora_1, lora_2, …)
+    and pass their values through to the Python ``**kwargs``."""
+    def __init__(self, data=None):
+        super().__init__(data or {})
+        self.type = _AnyType("*")
+        self._data = data
+
+    def __getitem__(self, key):
+        if self._data is not None and key in self._data:
+            return self._data[key]
+        return (self.type,)
+
+    def __contains__(self, key):
+        return True
+
+
+class RelayLoraSelector:
+    """Selects multiple LoRAs to stack together for a single temporal segment.
+    Uses a compact dynamic UI (add / toggle / strength controls) driven by the
+    frontend extension in ``web/relay_lora_selector.js``."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {},
+            "optional": _FlexibleOptionalInputType(),
+            "hidden": {},
+        }
+
+    RETURN_TYPES = ("RELAY_LORA_STACK",)
+    RETURN_NAMES = ("lora_stack",)
+    FUNCTION = "build_stack"
+    CATEGORY = "conditioning/prompt_relay"
+    OUTPUT_NODE = False
+
+    def build_stack(self, **kwargs):
+        stack = []
+        for key, value in kwargs.items():
+            if (
+                key.upper().startswith("LORA_")
+                and isinstance(value, dict)
+                and value.get("on")
+                and value.get("lora")
+                and value["lora"] not in ("none", "None", "")
+            ):
+                stack.append((value["lora"], value.get("strength", 1.0)))
+
+        if not stack:
+            log.info("[PromptRelay] RelayLoraSelector: no LoRAs selected, outputting None")
+            return (None,)
+
+        log.info("[PromptRelay] RelayLoraSelector: %d LoRAs: %s", len(stack), [n for n, _ in stack])
+        return (stack,)
+
+
 class PromptRelayLoraSchedule(io.ComfyNode):
-    """Applies different LoRAs to different temporal segments defined by PromptRelayEncode."""
+    """Applies different LoRA stacks to different temporal segments defined by PromptRelayEncode."""
 
     @classmethod
     def define_schema(cls):
-        lora_list = folder_paths.get_filename_list("loras")
         return io.Schema(
             node_id="PromptRelayLoraSchedule",
             display_name="Prompt Relay LoRA Schedule",
             category="conditioning/prompt_relay",
             description=(
-                "Applies different LoRAs to different temporal segments. Connect model and "
-                "relay_config from PromptRelayEncode. Each LoRA slot maps directly to a segment "
-                "(A→segment 0, B→segment 1, …). Set a slot to 'none' to skip that segment. "
-                "extend_last controls whether the last assigned LoRA fills remaining segments."
+                "Applies different LoRA stacks to different temporal segments. Connect model and "
+                "relay_config from PromptRelayEncode, then connect up to 6 Relay LoRA Selector "
+                "outputs — each stack maps to a segment (1→segment 0, 2→segment 1, …). "
+                "extend_last controls whether the last assigned stack fills remaining segments."
             ),
             inputs=[
                 io.Model.Input("model", tooltip="Model output from PromptRelayEncode."),
@@ -141,19 +204,13 @@ class PromptRelayLoraSchedule(io.ComfyNode):
                     "epsilon", default=1e-3, min=1e-6, max=0.99, step=1e-4,
                     tooltip="LoRA blend transition sharpness. Below ~0.1 gives sharp cuts (default 0.001). Use 0.5+ for softer crossfades.",
                 ),
-                io.Boolean.Input("extend_last", default=True, tooltip="If true, the last assigned LoRA fills any remaining segments beyond the LoRA slots."),
-                io.Combo.Input("lora_name", options=["none"] + lora_list, tooltip="LoRA for segment 0."),
-                io.Float.Input("strength", default=1.0, min=-10.0, max=10.0, step=0.01),
-                io.Combo.Input("lora_name_2", options=["none"] + lora_list, optional=True, tooltip="LoRA for segment 1."),
-                io.Float.Input("strength_2", default=1.0, min=-10.0, max=10.0, step=0.01, optional=True),
-                io.Combo.Input("lora_name_3", options=["none"] + lora_list, optional=True, tooltip="LoRA for segment 2."),
-                io.Float.Input("strength_3", default=1.0, min=-10.0, max=10.0, step=0.01, optional=True),
-                io.Combo.Input("lora_name_4", options=["none"] + lora_list, optional=True, tooltip="LoRA for segment 3."),
-                io.Float.Input("strength_4", default=1.0, min=-10.0, max=10.0, step=0.01, optional=True),
-                io.Combo.Input("lora_name_5", options=["none"] + lora_list, optional=True, tooltip="LoRA for segment 4."),
-                io.Float.Input("strength_5", default=1.0, min=-10.0, max=10.0, step=0.01, optional=True),
-                io.Combo.Input("lora_name_6", options=["none"] + lora_list, optional=True, tooltip="LoRA for segment 5."),
-                io.Float.Input("strength_6", default=1.0, min=-10.0, max=10.0, step=0.01, optional=True),
+                io.Boolean.Input("extend_last", default=True, tooltip="If true, the last assigned LoRA stack fills any remaining segments beyond the connected stacks."),
+                io.Custom("RELAY_LORA_STACK").Input("lora_stack_1", optional=True, tooltip="LoRA stack for segment 0."),
+                io.Custom("RELAY_LORA_STACK").Input("lora_stack_2", optional=True, tooltip="LoRA stack for segment 1."),
+                io.Custom("RELAY_LORA_STACK").Input("lora_stack_3", optional=True, tooltip="LoRA stack for segment 2."),
+                io.Custom("RELAY_LORA_STACK").Input("lora_stack_4", optional=True, tooltip="LoRA stack for segment 3."),
+                io.Custom("RELAY_LORA_STACK").Input("lora_stack_5", optional=True, tooltip="LoRA stack for segment 4."),
+                io.Custom("RELAY_LORA_STACK").Input("lora_stack_6", optional=True, tooltip="LoRA stack for segment 5."),
             ],
             outputs=[
                 io.Model.Output(display_name="model"),
@@ -161,33 +218,31 @@ class PromptRelayLoraSchedule(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, relay_config, lora_name, strength,
-                lora_name_2=None, strength_2=1.0,
-                lora_name_3=None, strength_3=1.0,
-                lora_name_4=None, strength_4=1.0,
-                lora_name_5=None, strength_5=1.0,
-                lora_name_6=None, strength_6=1.0,
-                epsilon=1e-3, extend_last=True) -> io.NodeOutput:
+    def execute(cls, model, relay_config, lora_stack_1,
+                epsilon=1e-3, extend_last=True,
+                lora_stack_2=None, lora_stack_3=None,
+                lora_stack_4=None, lora_stack_5=None,
+                lora_stack_6=None) -> io.NodeOutput:
 
-        # Build slot map: each slot maps to a LoRA column index or None (no LoRA)
-        all_slots = [
-            (lora_name, strength),
-            (lora_name_2, strength_2),
-            (lora_name_3, strength_3),
-            (lora_name_4, strength_4),
-            (lora_name_5, strength_5),
-            (lora_name_6, strength_6),
-        ]
+        all_stacks = [lora_stack_1, lora_stack_2, lora_stack_3, lora_stack_4, lora_stack_5, lora_stack_6]
 
-        lora_slot_map = []   # per-slot: LoRA column index or None
-        lora_entries = []    # only the non-none entries in column order
+        # Build a flat list of unique (name, strength) entries with deduplication
+        lora_entries = []       # [(name, strength), ...] in column order
+        lora_entry_index = {}   # (name, strength) -> column index
+        lora_slot_map = []      # per-slot: list of column indices (empty = no LoRAs)
 
-        for name, s in all_slots:
-            if name and name not in ("none", ""):
-                lora_slot_map.append(len(lora_entries))
-                lora_entries.append((name, s))
+        for stack in all_stacks:
+            if stack:
+                indices = []
+                for name, strength in stack:
+                    key = (name, strength)
+                    if key not in lora_entry_index:
+                        lora_entry_index[key] = len(lora_entries)
+                        lora_entries.append((name, strength))
+                    indices.append(lora_entry_index[key])
+                lora_slot_map.append(indices)
             else:
-                lora_slot_map.append(None)
+                lora_slot_map.append([])
 
         if not lora_entries:
             log.info("[PromptRelay] LoRA Schedule: no LoRAs assigned, passing model through unchanged")
@@ -262,10 +317,12 @@ import folder_paths
 
 NODE_CLASS_MAPPINGS = {
     "PromptRelayEncode": PromptRelayEncode,
+    "RelayLoraSelector": RelayLoraSelector,
     "PromptRelayLoraSchedule": PromptRelayLoraSchedule,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PromptRelayEncode": "Prompt Relay Encode",
+    "RelayLoraSelector": "Relay LoRA Selector",
     "PromptRelayLoraSchedule": "Prompt Relay LoRA Schedule",
 }

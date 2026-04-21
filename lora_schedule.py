@@ -66,30 +66,32 @@ def load_lora_weights(lora_name, model):
 
 
 def build_lora_assignment(num_segments, lora_slot_map, extend_last):
-    """Map each segment index to a LoRA column index or -1 (no LoRA).
+    """Map each segment index to a list of LoRA column indices.
 
-    lora_slot_map: list of LoRA column indices or None, one per slot.
-                   Slot *i* maps to segment *i*.  ``None`` means that slot is "none".
-    extend_last: if True, the last assigned LoRA fills any remaining segments.
+    lora_slot_map: list of lists of LoRA column indices, one per slot.
+                   An empty list means that slot has no LoRAs.
+    extend_last: if True, the last assigned LoRA list fills any remaining segments.
     """
     if num_segments == 0:
         raise ValueError("At least one segment is required")
 
     assignment = []
-    last_lora_idx = None
+    last_lora_indices = []
 
     for seg_idx in range(num_segments):
         if seg_idx < len(lora_slot_map):
             slot = lora_slot_map[seg_idx]
-            if slot is not None:
-                assignment.append(slot)
-                last_lora_idx = slot
+            if slot:
+                assignment.append(list(slot))
+                last_lora_indices = list(slot)
             else:
-                # Slot is "none" — no LoRA unless extending
-                assignment.append(last_lora_idx if extend_last and last_lora_idx is not None else -1)
+                assignment.append(
+                    list(last_lora_indices) if extend_last and last_lora_indices else []
+                )
         else:
-            # Beyond the LoRA slots
-            assignment.append(last_lora_idx if extend_last and last_lora_idx is not None else -1)
+            assignment.append(
+                list(last_lora_indices) if extend_last and last_lora_indices else []
+            )
 
     return assignment
 
@@ -101,6 +103,11 @@ def build_blend_tensor(segment_lengths, tokens_per_frame, lora_assignment, num_l
     LoRA's segment.  Inside the segment window the weight is 1.0; outside it
     decays as exp(-((d-window)^2) / (2*sigma^2)).  Smaller *epsilon* gives
     sharper transitions (same formula as the prompt-relay attention mask).
+
+    All LoRAs assigned to the same segment share the same temporal weight
+    profile (they stack additively in the forward pass).  When a deduplicated
+    LoRA appears in adjacent segments, ``torch.max`` keeps the weight at 1.0
+    across the transition instead of doubling it.
     """
     sigma = 1.0 / math.log(1.0 / epsilon) if 0 < epsilon < 1 else 0.1448
 
@@ -108,15 +115,16 @@ def build_blend_tensor(segment_lengths, tokens_per_frame, lora_assignment, num_l
     total_tokens = total_frames * tokens_per_frame
     blend = torch.zeros(total_tokens, num_loras, device=device)
 
-    # Collect metadata for segments that have a LoRA
+    # Collect metadata for segments that have LoRAs
     seg_info = []  # (midpoint, window, lora_idx)
     frame_cursor = 0
     for seg_idx, seg_len in enumerate(segment_lengths):
-        lora_idx = lora_assignment[seg_idx]
-        if lora_idx >= 0 and seg_len > 0:
+        lora_indices = lora_assignment[seg_idx]
+        if lora_indices and seg_len > 0:
             midpoint = (2 * frame_cursor + seg_len) // 2
             window = max(seg_len // 2 - 2, 0)
-            seg_info.append((midpoint, window, lora_idx))
+            for lora_idx in lora_indices:
+                seg_info.append((midpoint, window, lora_idx))
         frame_cursor += seg_len
 
     if not seg_info:
@@ -133,7 +141,9 @@ def build_blend_tensor(segment_lengths, tokens_per_frame, lora_assignment, num_l
             torch.exp(-((d - window).pow(2)) / two_sigma_sq),
         )
         token_weights = weights.repeat_interleave(tokens_per_frame)
-        blend[:, lora_idx] += token_weights
+        # Use max so that a deduplicated LoRA shared across adjacent segments
+        # stays at weight 1.0 instead of summing to 2.0 at the boundary.
+        blend[:, lora_idx] = torch.max(blend[:, lora_idx], token_weights)
 
     return blend
 
