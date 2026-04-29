@@ -422,6 +422,76 @@ class PromptRelayLoraSchedule(io.ComfyNode):
 
         return io.NodeOutput(patched)
 
+        patched, conditioning = _encode_relay(
+            model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon,
+        )
+        return io.NodeOutput(patched, conditioning)
+
+
+class PromptRelayEncodeTimeline(io.ComfyNode):
+    """WYSIWYG timeline variant — segments and lengths come from a visual editor in the node UI."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="PromptRelayEncodeTimeline",
+            display_name="Prompt Relay Encode (Timeline)",
+            category="conditioning/prompt_relay",
+            description=(
+                "Same as Prompt Relay Encode, but local prompts and segment lengths are edited "
+                "visually as draggable blocks on a timeline. The max_frames input only sets the "
+                "timeline scale (pixel space) — actual frame count is still read from the latent."
+            ),
+            inputs=[
+                io.Model.Input("model"),
+                io.Clip.Input("clip"),
+                io.Latent.Input("latent", tooltip="Empty latent video — dimensions are read from its shape."),
+                io.String.Input(
+                    "global_prompt", multiline=True, default="",
+                    tooltip="Conditions the entire video. Anchors persistent characters, objects, and scene context.",
+                ),
+                io.Int.Input(
+                    "max_frames", default=129, min=1, max=10000, step=1,
+                    tooltip="Total timeline length in pixel-space frames. Used by the editor for visual scale only.",
+                ),
+                io.String.Input(
+                    "timeline_data", default="",
+                    tooltip="JSON state of the timeline editor (auto-managed; do not edit by hand).",
+                ),
+                io.String.Input(
+                    "local_prompts", multiline=True, default="",
+                    tooltip="Auto-populated from the timeline editor.",
+                ),
+                io.String.Input(
+                    "segment_lengths", default="",
+                    tooltip="Auto-populated from the timeline editor (pixel-space frame counts).",
+                ),
+                io.Float.Input(
+                    "epsilon", default=1e-3, min=1e-6, max=0.99, step=1e-4,
+                    tooltip="Penalty decay parameter. Values below ~0.1 all produce sharp boundaries (paper default 0.001). For softer transitions, try 0.5 or higher.",
+                ),
+                io.Float.Input(
+                    "fps", default=24.0, min=0.1, max=240.0, step=0.1, optional=True,
+                    tooltip="Frames per second — only affects how time is displayed in the timeline editor when time_units is set to 'seconds'.",
+                ),
+                io.Combo.Input(
+                    "time_units", options=["frames", "seconds"], default="frames", optional=True,
+                    tooltip="Display the ruler, segment ranges, length input, and total in frames or seconds. Internal storage is always pixel-space frames.",
+                ),
+            ],
+            outputs=[
+                io.Model.Output(display_name="model"),
+                io.Conditioning.Output(display_name="positive"),
+            ],
+        )
+
+
+    @classmethod
+    def execute(cls, model, clip, latent, global_prompt, max_frames, timeline_data, local_prompts, segment_lengths, epsilon, fps=24.0, time_units="frames") -> io.NodeOutput:
+        patched, conditioning = _encode_relay(
+            model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon,
+        )
+        return io.NodeOutput(patched, conditioning)
 
 import folder_paths
 
