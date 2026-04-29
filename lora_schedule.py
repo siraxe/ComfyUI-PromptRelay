@@ -241,6 +241,22 @@ def apply_lora_temporal_patches(model_clone, lora_deltas_by_key, blend_tensor):
             log.warning("[PromptRelay] Cannot resolve module for key: %s", mod_key)
             continue
 
+        # Validate that LoRA dimensions are compatible with the module's weight.
+        # Mismatches occur when key resolution maps a LoRA trained for one model
+        # variant (e.g. LTX-V video-only) onto the wrong layer in another variant
+        # (e.g. LTX-V AV which has extra audio attention layers).
+        module_out, module_in = module.weight.shape
+        for i, (lora_up, lora_down, _) in enumerate(per_lora):
+            lora_in = lora_down.shape[1]
+            lora_out = lora_up.shape[0]
+            if lora_in != module_in or lora_out != module_out:
+                log.warning(
+                    "[PromptRelay] Skipping %s: LoRA #%d dims (%dx%d) incompatible "
+                    "with module weight (%dx%d)",
+                    mod_key, i, lora_out, lora_in, module_out, module_in,
+                )
+                continue
+
         patched_fn = _make_patched_linear(module, per_lora, blend_tensor)
         model_clone.add_object_patch(patch_key, _LinearPatch(patched_fn).__get__(module, type(module)))
         patched += 1
