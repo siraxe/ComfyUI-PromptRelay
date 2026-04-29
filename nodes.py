@@ -305,6 +305,7 @@ class PromptRelayLoraSchedule(io.ComfyNode):
                 "Applies different LoRA stacks to different temporal segments. Connect model and "
                 "relay_config from PromptRelayEncode, then connect up to 6 Relay LoRA Selector "
                 "outputs — each stack maps to a segment (1→segment 0, 2→segment 1, …). "
+                "lora_global is merged into every segment with additive strength. "
                 "extend_last controls whether the last assigned stack fills remaining segments."
             ),
             inputs=[
@@ -315,6 +316,7 @@ class PromptRelayLoraSchedule(io.ComfyNode):
                     tooltip="LoRA blend transition sharpness. Below ~0.1 gives sharp cuts (default 0.001). Use 0.5+ for softer crossfades.",
                 ),
                 io.Boolean.Input("extend_last", default=True, tooltip="If true, the last assigned LoRA stack fills any remaining segments beyond the connected stacks."),
+                io.Custom("RELAY_LORA_STACK").Input("lora_global", optional=True, tooltip="LoRA stack applied to ALL segments. Strengths add with per-segment stacks — e.g. global 0.3 + segment 0.6 = 0.9."),
                 io.Custom("RELAY_LORA_STACK").Input("lora_stack_1", optional=True, tooltip="LoRA stack for segment 0."),
                 io.Custom("RELAY_LORA_STACK").Input("lora_stack_2", optional=True, tooltip="LoRA stack for segment 1."),
                 io.Custom("RELAY_LORA_STACK").Input("lora_stack_3", optional=True, tooltip="LoRA stack for segment 2."),
@@ -328,13 +330,30 @@ class PromptRelayLoraSchedule(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, relay_config, lora_stack_1=None,
+    def execute(cls, model, relay_config, lora_global=None,
                 epsilon=1e-3, extend_last=True,
-                lora_stack_2=None, lora_stack_3=None,
-                lora_stack_4=None, lora_stack_5=None,
+                lora_stack_1=None, lora_stack_2=None,
+                lora_stack_3=None, lora_stack_4=None,
+                lora_stack_5=None,
                 lora_stack_6=None) -> io.NodeOutput:
 
-        all_stacks = [lora_stack_1, lora_stack_2, lora_stack_3, lora_stack_4, lora_stack_5, lora_stack_6]
+        per_segment = [lora_stack_1, lora_stack_2, lora_stack_3, lora_stack_4, lora_stack_5, lora_stack_6]
+
+        # Merge global LoRAs into each segment stack (additive strength for same-name LoRAs)
+        if lora_global:
+            all_stacks = []
+            for stack in per_segment:
+                if stack is None:
+                    all_stacks.append(list(lora_global))
+                else:
+                    combined = {}
+                    for name, strength in lora_global:
+                        combined[name] = combined.get(name, 0.0) + strength
+                    for name, strength in stack:
+                        combined[name] = combined.get(name, 0.0) + strength
+                    all_stacks.append(list(combined.items()))
+        else:
+            all_stacks = per_segment
 
         # Build a flat list of unique (name, strength) entries with deduplication
         lora_entries = []       # [(name, strength), ...] in column order
